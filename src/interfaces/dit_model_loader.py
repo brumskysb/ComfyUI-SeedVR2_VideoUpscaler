@@ -117,6 +117,25 @@ class SeedVR2LoadDiTModel(io.ComfyNode):
                         "Flash Attention and SageAttention provide speedup through optimized CUDA kernels on compatible GPUs."
                     )
                 ),
+                io.Boolean.Input("enable_nvfp4",
+                    default=False,
+                    optional=True,
+                    tooltip=(
+                        "Enable NVFP4 (4-bit floating point) quantization for DiT model weights.\n"
+                        "\n"
+                        "NVFP4 provides:\n"
+                        "• ~75% memory reduction compared to FP16 weights\n"
+                        "• Hardware acceleration on Blackwell GPUs (RTX 50xx, SM 10.0+)\n"
+                        "• Automatic fallback to eager/triton backend on older GPUs\n"
+                        "\n"
+                        "Requirements:\n"
+                        "• comfy-kitchen library: pip install comfy-kitchen[cublas]\n"
+                        "• Blackwell GPU recommended for optimal performance\n"
+                        "\n"
+                        "Note: Quality impact is minimal due to block quantization with 16-element blocks.\n"
+                        "Not compatible with GGUF quantized models (use one or the other)."
+                    )
+                ),
                 io.Custom("TORCH_COMPILE_ARGS").Input("torch_compile_args",
                     optional=True,
                     tooltip=(
@@ -136,6 +155,7 @@ class SeedVR2LoadDiTModel(io.ComfyNode):
     def execute(cls, model: str, device: str, offload_device: str = "none",
                      cache_model: bool = False, blocks_to_swap: int = 0, 
                      swap_io_components: bool = False, attention_mode: str = "sdpa",
+                     enable_nvfp4: bool = False,
                      torch_compile_args: Dict[str, Any] = None) -> io.NodeOutput:
         """
         Create DiT model configuration for SeedVR2 main node
@@ -148,6 +168,7 @@ class SeedVR2LoadDiTModel(io.ComfyNode):
             blocks_to_swap: Number of transformer blocks to swap (requires offload_device != device)
             swap_io_components: Whether to offload I/O components (requires offload_device != device)
             attention_mode: Attention computation backend ('sdpa', 'flash_attn_2', 'flash_attn_3', 'sageattn_2', or 'sageattn_3')
+            enable_nvfp4: Enable NVFP4 quantization for DiT model weights (requires comfy-kitchen)
             torch_compile_args: Optional torch.compile configuration from settings node
             
         Returns:
@@ -173,6 +194,7 @@ class SeedVR2LoadDiTModel(io.ComfyNode):
             "blocks_to_swap": blocks_to_swap,
             "swap_io_components": swap_io_components,
             "attention_mode": attention_mode,
+            "enable_nvfp4": enable_nvfp4,
             "torch_compile_args": torch_compile_args,
             "node_id": get_executing_context().node_id,
         }

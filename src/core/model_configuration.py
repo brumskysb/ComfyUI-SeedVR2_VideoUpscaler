@@ -72,6 +72,7 @@ from ..models.video_vae_v3.modules.causal_inflation_lib import InflatedCausalCon
 from ..optimization.compatibility import (
     CompatibleDiT,
     TRITON_AVAILABLE,
+    COMFY_KITCHEN_AVAILABLE,
     validate_attention_mode
 )
 from ..optimization.blockswap import is_blockswap_enabled, validate_blockswap_config, apply_block_swap_to_dit, cleanup_blockswap
@@ -748,6 +749,7 @@ def configure_runner(
     decode_tile_overlap: Optional[Tuple[int, int]] = None,
     tile_debug: str = "false",
     attention_mode: str = 'sdpa',
+    enable_nvfp4: bool = False,
     torch_compile_args_dit: Optional[Dict[str, Any]] = None,
     torch_compile_args_vae: Optional[Dict[str, Any]] = None
 ) -> Tuple[VideoDiffusionInfer, Dict[str, Any]]:
@@ -775,6 +777,7 @@ def configure_runner(
         decode_tile_overlap: Tile overlap for decoding (height, width)
         tile_debug: Tile visualization mode (false/encode/decode)
         attention_mode: Attention computation backend ('sdpa', 'flash_attn_2', 'flash_attn_3', 'sageattn_2', or 'sageattn_3')
+        enable_nvfp4: Enable NVFP4 quantization for DiT model (requires comfy-kitchen)
         torch_compile_args_dit: Optional torch.compile configuration for DiT model
         torch_compile_args_vae: Optional torch.compile configuration for VAE model
         
@@ -787,6 +790,7 @@ def configure_runner(
         - Optional torch.compile optimization for inference speedup
         - Separate encode/decode tiling configuration for optimal performance
         - Memory optimization and BlockSwap integration
+        - NVFP4 quantization for Blackwell GPU acceleration
         
     Raises:
         ValueError: If debug instance is not provided
@@ -809,18 +813,24 @@ def configure_runner(
         dit_model, vae_model, debug
     )
     
+    # Store nvfp4 setting in cache context for use during model setup
+    cache_context['enable_nvfp4'] = enable_nvfp4
+    
     # Phase 2: Get or create runner
     runner = _acquire_runner(
         cache_context, dit_model, vae_model, 
         base_cache_dir, debug
     )
     
+    # Get enable_nvfp4 from cache_context (set earlier in configure_runner)
+    enable_nvfp4 = cache_context.get('enable_nvfp4', False)
+    
     # Phase 3: Configure runner settings
     _configure_runner_settings(
         runner, ctx,
         encode_tiled, encode_tile_size, encode_tile_overlap,
         decode_tiled, decode_tile_size, decode_tile_overlap,
-        tile_debug, attention_mode,
+        tile_debug, attention_mode, enable_nvfp4,
         torch_compile_args_dit, torch_compile_args_vae,
         block_swap_config, debug
     )
@@ -845,13 +855,14 @@ def _configure_runner_settings(
     decode_tile_overlap: Optional[Tuple[int, int]],
     tile_debug: str,
     attention_mode: str,
+    enable_nvfp4: bool,
     torch_compile_args_dit: Optional[Dict[str, Any]],
     torch_compile_args_vae: Optional[Dict[str, Any]],
     block_swap_config: Optional[Dict[str, Any]],
     debug: Optional['Debug'] = None
 ) -> None:
     """
-    Configure runner settings for VAE tiling, torch.compile, and BlockSwap.
+    Configure runner settings for VAE tiling, torch.compile, NVFP4, and BlockSwap.
     
     Stores configuration settings on runner for later comparison and application.
     Settings are stored in temporary "_new_*" attributes and later validated/applied
@@ -869,6 +880,7 @@ def _configure_runner_settings(
         decode_tile_overlap: Overlap dimensions (height, width) between decoding tiles
         tile_debug: Tile visualization mode (false/encode/decode)
         attention_mode: Attention computation backend ('sdpa', 'flash_attn_2', 'flash_attn_3', 'sageattn_2', or 'sageattn_3')
+        enable_nvfp4: Enable NVFP4 quantization for DiT model (requires comfy-kitchen)
         torch_compile_args_dit: torch.compile configuration for DiT model or None
         torch_compile_args_vae: torch.compile configuration for VAE model or None
         block_swap_config: BlockSwap configuration for DiT model or None
@@ -897,6 +909,9 @@ def _configure_runner_settings(
         'decode_tile_size': decode_tile_size,
         'decode_tile_overlap': decode_tile_overlap
     }
+    
+    # NVFP4 quantization setting (stored for apply_model_specific_config)
+    runner._enable_nvfp4 = enable_nvfp4
     
     # Store device configuration on runner for submodule access (e.g., BlockSwap, Cleanup)
     runner._dit_device = ctx['dit_device']
@@ -1211,6 +1226,45 @@ def apply_model_specific_config(model: torch.nn.Module, runner: VideoDiffusionIn
             
             if updated_count > 0:
                 debug.log(f"Applied {attention_mode} and compute_dtype={compute_dtype} to {updated_count} modules", category="success")
+
+        # Apply NVFP4 quantization before BlockSwap and torch.compile (if enabled)
+        # NVFP4 replaces Linear layers with quantized versions for Blackwell GPU acceleration
+        enable_nvfp4 = getattr(runner, '_enable_nvfp4', False)
+        if enable_nvfp4 and not getattr(model, '_nvfp4_applied', False):
+            if COMFY_KITCHEN_AVAILABLE:
+                from ..optimization.nvfp4_ops import quantize_dit_model_nvfp4, check_nvfp4_hardware_support
+                
+                debug.log("Applying NVFP4 quantization to DiT model...", category="nvfp4")
+                debug.start_timer("nvfp4_quantization")
+                
+                # Check hardware support
+                hw_supported, hw_msg = check_nvfp4_hardware_support()
+                debug.log(f"Hardware: {hw_msg}", category="nvfp4", indent_level=1)
+                
+                # Get the actual model to quantize (unwrap if needed)
+                actual_model = model.dit_model if hasattr(model, 'dit_model') else model
+                
+                # Apply NVFP4 quantization
+                result = quantize_dit_model_nvfp4(actual_model, debug)
+                
+                if result["success"]:
+                    debug.log(f"NVFP4 quantization complete: {result['layers_quantized']} layers", 
+                             category="success", indent_level=1)
+                    if result["stats"].get("memory_saved_mb", 0) > 0:
+                        debug.log(f"Estimated VRAM saved: {result['stats']['memory_saved_mb']:.1f} MB", 
+                                 category="nvfp4", indent_level=1)
+                    model._nvfp4_applied = True
+                else:
+                    debug.log(f"NVFP4 quantization failed: {result['error']}", 
+                             level="WARNING", category="nvfp4", force=True)
+                
+                debug.end_timer("nvfp4_quantization", "NVFP4 quantization")
+            else:
+                debug.log(
+                    "NVFP4 quantization requested but comfy-kitchen not installed.\n"
+                    "Install with: pip install comfy-kitchen[cublas]",
+                    level="WARNING", category="nvfp4", force=True
+                )
 
         # Apply BlockSwap before torch.compile (only if not already active)
         # BlockSwap wraps forward methods, and torch.compile needs to capture the wrapped version

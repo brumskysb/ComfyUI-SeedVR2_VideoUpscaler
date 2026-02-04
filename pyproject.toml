@@ -27,6 +27,9 @@ dependencies = [
     "matplotlib"
 ]
 
+[project.optional-dependencies]
+nvfp4 = ["comfy-kitchen[cublas]"]
+
 [project.urls]
 Repository = "https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler"
 Documentation = "https://www.youtube.com/@AInVFX"
