@@ -5,19 +5,19 @@ Provides runtime NVFP4 (4-bit floating point) quantization support for DiT model
 using the comfy-kitchen library for Blackwell GPU optimizations.
 
 NVFP4 (NVIDIA FP4) is a 4-bit floating point format (E2M1) that provides:
-- 4x memory reduction compared to FP16
+- ~75% memory reduction compared to FP16 (4-bit vs 16-bit)
 - Hardware acceleration on SM ≥ 10.0 (Blackwell/RTX 50xx)
 - Block quantization with 16-element blocks for accuracy
 
 Requirements:
 - comfy-kitchen library: pip install comfy-kitchen[cublas]
-- Blackwell GPU (SM 10.0+) for hardware acceleration
+- Blackwell GPU (SM 10.0+) recommended for hardware acceleration
 - Falls back to eager/triton backends on older GPUs
 """
 
 import torch
 import torch.nn as nn
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict, Tuple, Any
 
 # Import comfy-kitchen with fallback
 try:
@@ -30,34 +30,8 @@ except ImportError:
     QuantizedTensor = None
     TensorCoreNVFP4Layout = None
 
-
-def validate_nvfp4_availability(operation: str = "use NVFP4 quantization", debug=None) -> None:
-    """
-    Validate comfy-kitchen availability for NVFP4 operations.
-    
-    Args:
-        operation: Description of the operation requiring NVFP4
-        debug: Optional debug instance for logging
-        
-    Raises:
-        RuntimeError: If comfy-kitchen is not available
-    """
-    if not COMFY_KITCHEN_AVAILABLE:
-        error_msg = (
-            f"Cannot {operation}: comfy-kitchen library is not installed.\n"
-            f"\n"
-            f"NVFP4 provides 4-bit quantization for memory-efficient DiT inference.\n"
-            f"Requires Blackwell GPU (RTX 50xx) for hardware acceleration.\n"
-            f"\n"
-            f"To fix this issue:\n"
-            f"  1. Install comfy-kitchen: pip install comfy-kitchen[cublas]\n"
-            f"  2. OR disable NVFP4 quantization in settings\n"
-            f"\n"
-            f"For more info: https://github.com/Comfy-Org/comfy-kitchen"
-        )
-        if debug:
-            debug.log(error_msg, level="ERROR", category="setup", force=True)
-        raise RuntimeError(f"comfy-kitchen library required to {operation}")
+# Import validate function from compatibility to avoid duplication
+from .compatibility import validate_nvfp4_availability
 
 
 def check_nvfp4_hardware_support(device: torch.device = None) -> Tuple[bool, str]:
@@ -296,7 +270,7 @@ def replace_linear_with_nvfp4(module: nn.Module, debug: Optional['Debug'] = None
     return replacements_made, stats
 
 
-def quantize_dit_model_nvfp4(model: nn.Module, debug: Optional['Debug'] = None) -> Dict[str, any]:
+def quantize_dit_model_nvfp4(model: nn.Module, debug: Optional['Debug'] = None) -> Dict[str, Any]:
     """
     Quantize a DiT model to NVFP4 format.
     

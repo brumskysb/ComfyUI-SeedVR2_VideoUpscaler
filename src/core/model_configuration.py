@@ -862,7 +862,7 @@ def _configure_runner_settings(
     debug: Optional['Debug'] = None
 ) -> None:
     """
-    Configure runner settings for VAE tiling, torch.compile, NVFP4, and BlockSwap.
+    Configure runner settings for VAE tiling, attention mode, NVFP4, torch.compile, and BlockSwap.
     
     Stores configuration settings on runner for later comparison and application.
     Settings are stored in temporary "_new_*" attributes and later validated/applied

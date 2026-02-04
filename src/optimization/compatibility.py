@@ -564,7 +564,7 @@ except ImportError:
     GGMLQuantizationType = None
 
 
-# 4. comfy-kitchen - Required for NVFP4 quantization (Blackwell GPUs)
+# 4. comfy-kitchen - Required for NVFP4 quantization (Blackwell GPUs recommended for HW acceleration)
 try:
     import comfy_kitchen as ck
     from comfy_kitchen.tensor import QuantizedTensor, TensorCoreNVFP4Layout

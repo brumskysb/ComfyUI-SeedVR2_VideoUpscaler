@@ -317,6 +317,7 @@ We're actively working on improvements and new features. To stay informed:
 
 ### Performance Features
 - **torch.compile Integration**: Optional 20-40% DiT speedup and 15-25% VAE speedup with PyTorch 2.0+ compilation
+- **NVFP4 Quantization**: 4-bit floating point (E2M1) quantization for DiT models using [comfy-kitchen](https://github.com/Comfy-Org/comfy-kitchen) - provides ~75% VRAM reduction with hardware acceleration on Blackwell GPUs (RTX 50xx, SM 10.0+). Falls back to triton/eager backend on older GPUs.
 - **Multi-GPU CLI**: Distribute workload across multiple GPUs with automatic temporal overlap blending
 - **Model Caching**: Keep models loaded between generations for single-GPU directory processing or multi-GPU streaming
 - **Flexible Attention Backends**: Choose between PyTorch SDPA (stable, always available), Flash Attention 2/3, or SageAttention 2/3 for faster computation on supported hardware
@@ -349,6 +350,7 @@ With the current optimizations (tiling, BlockSwap, GGUF quantization), SeedVR2 c
 - **PyTorch**: 2.0+ for torch.compile support (optional but recommended)
 - **Triton**: Required for torch.compile with inductor backend (optional)
 - **Flash Attention / SageAttention**: Flash Attention 2 (Ampere+), Flash Attention 3 (Hopper+), SageAttention 2 or SageAttention 3 (Blackwell) provide faster attention computation on supported hardware (optional, falls back to PyTorch SDPA)
+- **comfy-kitchen**: Required for NVFP4 quantization support (optional, Blackwell GPUs recommended): `pip install comfy-kitchen[cublas]`
 
 ## 📦 Installation
 
