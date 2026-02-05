@@ -63,7 +63,8 @@ from typing import Dict, Any, Optional, Tuple, Union, Callable
 
 from .model_loader import (
     prepare_model_structure,
-    script_directory
+    script_directory,
+    detect_model_architecture
 )
 from .infer import VideoDiffusionInfer
 from .model_cache import get_global_cache
@@ -696,12 +697,17 @@ def _create_new_runner(
     runner instance, and initializes with default settings. Called when no cached
     runner template is available or when model selection changes.
     
+    Model architecture detection:
+    1. First tries to detect architecture from checkpoint file by inspecting
+       tensor shapes and block counts (most accurate method)
+    2. Falls back to filename-based detection if checkpoint inspection fails
+       - Contains "7b" → loads configs_7b/main.yaml
+       - Otherwise → loads configs_3b/main.yaml
+    
     Args:
         dit_model: DiT model filename (determines config selection)
-                  - Contains "7b" → loads configs_7b/main.yaml
-                  - Otherwise → loads configs_3b/main.yaml
         vae_model: VAE model filename (stored for reference, not used in config selection)
-        base_cache_dir: Base directory for model files (not used directly but passed for context)
+        base_cache_dir: Base directory for model files
         debug: Debug instance for logging and timing
         
     Returns:
@@ -715,8 +721,32 @@ def _create_new_runner(
              category="runner", force=True)
     
     debug.start_timer("config_load")
+    
+    # Determine model architecture - prefer checkpoint-based detection
+    model_arch = None
+    
+    # Try to find and inspect checkpoint file for architecture detection
+    dit_checkpoint_path = None
+    try:
+        dit_checkpoint_path = find_model_file(dit_model, base_cache_dir)
+    except Exception as e:
+        debug.log(f"Could not find model file '{dit_model}': {e}", level="WARNING", category="dit")
+    
+    # Try to detect architecture from checkpoint if file was found
+    if dit_checkpoint_path and os.path.exists(dit_checkpoint_path):
+        try:
+            model_arch = detect_model_architecture(dit_checkpoint_path, debug)
+            debug.log(f"Detected model architecture from checkpoint: {model_arch.upper()}", category="dit")
+        except Exception as e:
+            debug.log(f"Architecture detection from checkpoint failed: {e}", level="WARNING", category="dit")
+    
+    # Fall back to filename-based detection
+    if model_arch is None:
+        model_arch = "7b" if "7b" in dit_model.lower() else "3b"
+        debug.log(f"Using filename-based architecture detection: {model_arch.upper()}", category="dit")
+    
     config_path = os.path.join(script_directory, 
-                              './configs_7b' if "7b" in dit_model else './configs_3b', 
+                              f'./configs_{model_arch}', 
                               'main.yaml')
     config = load_config(config_path)
     debug.end_timer("config_load", "Config loading")

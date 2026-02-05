@@ -706,9 +706,25 @@ def manage_model_device(model: torch.nn.Module, target_device: torch.device, mod
             if hasattr(model, "dit_model"):
                 actual_model = model.dit_model
 
-    # Get current device
+    # Check if model has an inner dit_model (CompatibleDiT wrapper)
+    inner_model = getattr(model, 'dit_model', None)
+
+    # Get current device - check multiple parameters for robustness
+    # Some wrappers may have parameters on different devices
     try:
+        # Try to get device from first parameter
         current_device = next(model.parameters()).device
+        
+        # For wrapped models, also check the inner model's device
+        # In case the wrapper iteration doesn't work as expected
+        if current_device.type == 'meta' and inner_model is not None:
+            inner_device = next(inner_model.parameters()).device
+            if inner_device.type != 'meta':
+                if debug:
+                    debug.log(f"Warning: Wrapper reports meta but inner model is on {inner_device}. Using inner model device.",
+                             level="WARNING", category=model_name.lower(), force=True)
+                current_device = inner_device
+                
     except StopIteration:
         return False
     

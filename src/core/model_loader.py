@@ -56,9 +56,11 @@ from typing import Dict, Any, Optional, Tuple, Union, Callable
 # Import SafeTensors with fallback
 try:
     from safetensors.torch import load_file as load_safetensors_file
+    from safetensors import safe_open
     SAFETENSORS_AVAILABLE = True
 except ImportError:
     SAFETENSORS_AVAILABLE = False
+    safe_open = None
 
 from .infer import VideoDiffusionInfer
 from ..common.config import create_object
@@ -79,6 +81,19 @@ from ..utils.constants import get_script_directory, suppress_tensor_warnings
 
 # Get script directory for config paths
 script_directory = get_script_directory()
+
+# Model architecture detection constants
+# 3B model: num_layers=32, vid_dim=2560
+# 7B model: num_layers=36, vid_dim=3072
+ARCH_3B_LAYERS = 32
+ARCH_7B_LAYERS = 36
+ARCH_3B_VID_DIM = 2560
+ARCH_7B_VID_DIM = 3072
+# Thresholds for classification when values don't match exactly
+# Layer threshold: midpoint between 32 and 36 = 34
+ARCH_LAYER_THRESHOLD = (ARCH_3B_LAYERS + ARCH_7B_LAYERS) // 2  # 34
+# Dimension threshold: midpoint between 2560 and 3072 = 2816
+ARCH_DIM_THRESHOLD = (ARCH_3B_VID_DIM + ARCH_7B_VID_DIM) // 2  # 2816
 
 
 def load_quantized_state_dict(checkpoint_path: str, device: torch.device = torch.device("cpu"),
@@ -151,6 +166,260 @@ def load_quantized_state_dict(checkpoint_path: str, device: torch.device = torch
         raise ValueError(f"Unsupported checkpoint format. Expected .safetensors or .pth, got: {checkpoint_path}")
     
     return state
+
+
+def detect_model_architecture(checkpoint_path: str, debug: Optional['Debug'] = None) -> str:
+    """
+    Detect model architecture (3B or 7B) from checkpoint file.
+    
+    This function inspects the checkpoint to determine the model size by examining:
+    1. The number of transformer blocks (num_layers)
+    2. The hidden dimension (vid_dim) from key tensor shapes
+    
+    Architecture signatures:
+    - 3B model: num_layers=32, vid_dim=2560, heads=20
+    - 7B model: num_layers=36, vid_dim=3072, heads=24
+    
+    Args:
+        checkpoint_path: Path to checkpoint file (.safetensors, .gguf, or .pth)
+        debug: Optional Debug instance for logging
+        
+    Returns:
+        str: "7b" if 7B model detected, "3b" otherwise (default)
+        
+    Note:
+        Falls back to "3b" if detection fails or architecture is ambiguous.
+        This maintains backward compatibility with existing behavior.
+    """
+    if debug:
+        debug.log(f"Detecting model architecture from: {os.path.basename(checkpoint_path)}", category="dit")
+    
+    try:
+        if checkpoint_path.endswith('.safetensors'):
+            return _detect_safetensors_architecture(checkpoint_path, debug)
+        elif checkpoint_path.endswith('.gguf'):
+            return _detect_gguf_architecture(checkpoint_path, debug)
+        elif checkpoint_path.endswith('.pth'):
+            return _detect_pth_architecture(checkpoint_path, debug)
+        else:
+            if debug:
+                debug.log(f"Unknown checkpoint format, defaulting to 3B", category="dit")
+            return "3b"
+    except Exception as e:
+        if debug:
+            debug.log(f"Architecture detection failed: {e}, defaulting to 3B", level="WARNING", category="dit", force=True)
+        return "3b"
+
+
+def _detect_safetensors_architecture(checkpoint_path: str, debug: Optional['Debug'] = None) -> str:
+    """
+    Detect architecture from SafeTensors file by inspecting tensor metadata.
+    
+    Uses safe_open to read tensor shapes without loading full weights into memory.
+    """
+    if not SAFETENSORS_AVAILABLE or safe_open is None:
+        if debug:
+            debug.log("SafeTensors not available for architecture detection", category="dit")
+        return "3b"
+    
+    with safe_open(checkpoint_path, framework="pt") as f:
+        keys = f.keys()
+        
+        # Detect number of blocks by finding highest block index
+        max_block_idx = -1
+        for key in keys:
+            if key.startswith("blocks."):
+                parts = key.split(".")
+                if len(parts) >= 2:
+                    try:
+                        block_idx = int(parts[1])
+                        max_block_idx = max(max_block_idx, block_idx)
+                    except ValueError:
+                        continue
+        
+        num_layers = max_block_idx + 1 if max_block_idx >= 0 else 0
+        
+        # Detect hidden dimension from vid_out_norm.weight or similar
+        # These tensors have the hidden dimension as their first (and often only) dimension:
+        # - vid_out_norm.weight: shape [vid_dim] - layer norm weight
+        # - blocks.0.ada.all.attn_shift: shape [vid_dim] - adaptive layer shift
+        # - emb_in.linear2.weight: shape [emb_dim, hidden] where we want the output dim
+        vid_dim = None
+        # Priority order: single-dim tensors first (clearest signal)
+        dim_keys = ["vid_out_norm.weight", "blocks.0.ada.all.attn_shift"]
+        for dim_key in dim_keys:
+            if dim_key in keys:
+                # Use get_slice to get shape metadata without loading full tensor into memory
+                # For 1D tensors like norm weights and shift params, shape[0] is the hidden dim
+                try:
+                    tensor_slice = f.get_slice(dim_key)
+                    tensor_shape = tensor_slice.get_shape()
+                    if len(tensor_shape) >= 1:
+                        vid_dim = tensor_shape[0]
+                        break
+                except (AttributeError, KeyError):
+                    # Fallback: load tensor if get_slice not available (older safetensors)
+                    tensor_shape = f.get_tensor(dim_key).shape
+                    if len(tensor_shape) >= 1:
+                        vid_dim = tensor_shape[0]
+                        break
+        
+        return _classify_architecture(num_layers, vid_dim, debug)
+
+
+def _detect_gguf_architecture(checkpoint_path: str, debug: Optional['Debug'] = None) -> str:
+    """
+    Detect architecture from GGUF file.
+    """
+    if not GGUF_AVAILABLE:
+        if debug:
+            debug.log("GGUF not available for architecture detection", category="dit")
+        return "3b"
+    
+    reader = gguf.GGUFReader(checkpoint_path)
+    
+    # Detect number of blocks
+    max_block_idx = -1
+    vid_dim = None
+    
+    for tensor in reader.tensors:
+        name = tensor.name
+        # Remove common prefixes
+        if name.startswith("model.diffusion_model."):
+            name = name[len("model.diffusion_model."):]
+        
+        if name.startswith("blocks."):
+            parts = name.split(".")
+            if len(parts) >= 2:
+                try:
+                    block_idx = int(parts[1])
+                    max_block_idx = max(max_block_idx, block_idx)
+                except ValueError:
+                    continue
+        
+        # Try to detect vid_dim from specific 1D tensors
+        # These are the same tensors we check in SafeTensors detection
+        if name in ["vid_out_norm.weight", "blocks.0.ada.all.attn_shift"]:
+            shape = tensor.shape
+            if len(shape) >= 1:
+                # GGUF stores shapes in C order (row-major), same as PyTorch
+                # For 1D tensors, shape[0] is the dimension we want
+                # Note: Earlier versions had shapes reversed, but current gguf library
+                # returns shapes in standard order
+                vid_dim = shape[0]
+    
+    num_layers = max_block_idx + 1 if max_block_idx >= 0 else 0
+    return _classify_architecture(num_layers, vid_dim, debug)
+
+
+def _detect_pth_architecture(checkpoint_path: str, debug: Optional['Debug'] = None) -> str:
+    """
+    Detect architecture from PyTorch checkpoint file.
+    Uses memory-mapped loading to avoid loading full weights into memory.
+    """
+    # Load with mmap=True to memory-map the file, reducing memory usage
+    # map_location="cpu" is required because mmap is not compatible with "meta"
+    state = torch.load(checkpoint_path, map_location="cpu", mmap=True, weights_only=True)
+    
+    max_block_idx = -1
+    vid_dim = None
+    
+    for key, tensor in state.items():
+        if key.startswith("blocks."):
+            parts = key.split(".")
+            if len(parts) >= 2:
+                try:
+                    block_idx = int(parts[1])
+                    max_block_idx = max(max_block_idx, block_idx)
+                except ValueError:
+                    continue
+        
+        if key in ["vid_out_norm.weight", "blocks.0.ada.all.attn_shift"]:
+            if hasattr(tensor, 'shape') and len(tensor.shape) >= 1:
+                vid_dim = tensor.shape[0]
+    
+    num_layers = max_block_idx + 1 if max_block_idx >= 0 else 0
+    del state
+    
+    return _classify_architecture(num_layers, vid_dim, debug)
+
+
+def _classify_architecture(num_layers: int, vid_dim: Optional[int], debug: Optional['Debug'] = None) -> str:
+    """
+    Classify model architecture based on detected parameters.
+    
+    Architecture signatures:
+    - 3B model: num_layers=32, vid_dim=2560
+    - 7B model: num_layers=36, vid_dim=3072
+    
+    Classification priority:
+    1. Exact num_layers match (32 or 36) is authoritative
+    2. Exact vid_dim match (2560 or 3072) is authoritative  
+    3. Threshold-based detection is used when exact matches aren't found
+    4. If num_layers and vid_dim conflict, vid_dim takes precedence (more reliable)
+    5. Defaults to "3b" for backward compatibility
+    
+    Args:
+        num_layers: Detected number of transformer blocks
+        vid_dim: Detected hidden dimension (can be None)
+        debug: Optional Debug instance
+        
+    Returns:
+        "7b" if 7B architecture detected, "3b" otherwise
+    """
+    if debug:
+        debug.log(f"Detected architecture: num_layers={num_layers}, vid_dim={vid_dim}", category="dit", indent_level=1)
+    
+    # Track what each indicator suggests for conflict detection
+    layers_suggests = None  # None = unknown, True = 7B, False = 3B
+    dim_suggests = None
+    
+    # Check num_layers
+    if num_layers == ARCH_7B_LAYERS:  # 36
+        layers_suggests = True  # 7B
+    elif num_layers == ARCH_3B_LAYERS:  # 32
+        layers_suggests = False  # 3B
+    elif num_layers > ARCH_LAYER_THRESHOLD:  # > 34
+        layers_suggests = True  # likely 7B
+    elif num_layers > 0:
+        layers_suggests = False  # likely 3B
+    
+    # Check vid_dim
+    if vid_dim is not None:
+        if vid_dim == ARCH_7B_VID_DIM:  # 3072
+            dim_suggests = True  # 7B
+        elif vid_dim == ARCH_3B_VID_DIM:  # 2560
+            dim_suggests = False  # 3B
+        elif vid_dim > ARCH_DIM_THRESHOLD:  # > 2816
+            dim_suggests = True  # likely 7B
+        else:
+            dim_suggests = False  # likely 3B
+    
+    # Detect and log conflicts
+    if layers_suggests is not None and dim_suggests is not None and layers_suggests != dim_suggests:
+        layers_str = "7B" if layers_suggests else "3B"
+        dim_str = "7B" if dim_suggests else "3B"
+        if debug:
+            debug.log(
+                f"Warning: Architecture indicators conflict - layers suggest {layers_str}, "
+                f"dimensions suggest {dim_str}. Using dimension-based result (more reliable).",
+                level="WARNING", category="dit", indent_level=1, force=True
+            )
+    
+    # Determine final result
+    # Priority: exact dim > exact layers > threshold dim > threshold layers > default
+    if dim_suggests is not None:
+        is_7b = dim_suggests  # vid_dim takes precedence (more reliable indicator)
+    elif layers_suggests is not None:
+        is_7b = layers_suggests
+    else:
+        is_7b = False  # default to 3B
+    
+    result = "7b" if is_7b else "3b"
+    if debug:
+        debug.log(f"Architecture classification: {result.upper()}", category="dit", indent_level=1)
+    
+    return result
 
 
 def _load_gguf_state(checkpoint_path: str, device: torch.device, debug: Optional['Debug'] = None,
@@ -525,11 +794,33 @@ def materialize_model(runner: VideoDiffusionInfer, model_type: str, device: torc
     # Load weights (this materializes from meta to target device)
     model = _load_model_weights(model, checkpoint_path, target_device, True,
                                model_type_upper, offload_reason, debug, override_dtype) 
+    
+    # Verify model is on expected device after loading
+    actual_device = next(model.parameters()).device
+    if actual_device.type == 'meta':
+        debug.log(f"ERROR: {model_type_upper} still on meta device after weight loading!", 
+                 level="ERROR", category=model_type, force=True)
+        raise RuntimeError(f"{model_type_upper} failed to materialize from meta device")
+    elif actual_device != target_device:
+        debug.log(f"Note: {model_type_upper} on {actual_device} (expected {target_device})",
+                 category=model_type)
    
     # Apply model-specific configurations (includes BlockSwap and torch.compile)
     # Import here to avoid circular dependency 
     from .model_configuration import apply_model_specific_config
     model = apply_model_specific_config(model, runner, config, is_dit, debug)
+    
+    # Verify runner reference is updated after apply_model_specific_config
+    # This handles edge cases where apply_model_specific_config might not update runner.dit correctly
+    if is_dit:
+        final_device = next(runner.dit.parameters()).device
+        if final_device.type == 'meta':
+            # Auto-recover by force updating runner.dit
+            debug.log(f"Warning: runner.dit still on meta device after config application, auto-correcting",
+                     level="WARNING", category=model_type, force=True)
+            runner.dit = model
+            debug.log(f"Corrected: runner.dit updated to materialized model on {next(runner.dit.parameters()).device}",
+                     category=model_type, force=True)
     
     debug.end_timer(f"{model_type}_materialize", f"{model_type_upper} materialized")
     
