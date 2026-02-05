@@ -871,36 +871,29 @@ def _ensure_device_consistency(model: torch.nn.Module, target_device: torch.devi
     # Check and move buffers
     for name, buffer in model.named_buffers():
         if buffer is not None and buffer.device != target_device:
+            # Get module and buffer name
+            module_path = name.rsplit('.', 1)[0] if '.' in name else ''
+            buffer_name = name.rsplit('.', 1)[1] if '.' in name else name
+            
+            if module_path:
+                module = model
+                for part in module_path.split('.'):
+                    module = getattr(module, part)
+            else:
+                module = model
+            
+            # Determine persistence: if buffer appears in state_dict, it's persistent
+            # Use state_dict() check which is the official way to determine persistence
+            module_state_dict = module.state_dict()
+            is_persistent = buffer_name in module_state_dict
+            
             if buffer.device.type == 'meta':
                 # Meta buffers should have been handled by initialize_meta_buffers
                 # but handle any missed ones
-                module_path = name.rsplit('.', 1)[0] if '.' in name else ''
-                buffer_name = name.rsplit('.', 1)[1] if '.' in name else name
-                
-                if module_path:
-                    module = model
-                    for part in module_path.split('.'):
-                        module = getattr(module, part)
-                else:
-                    module = model
-                
                 initialized_buffer = torch.zeros_like(buffer, device=target_device)
-                module.register_buffer(buffer_name, initialized_buffer, persistent=False)
+                module.register_buffer(buffer_name, initialized_buffer, persistent=is_persistent)
             else:
                 # Move buffer from wrong device to target device
-                module_path = name.rsplit('.', 1)[0] if '.' in name else ''
-                buffer_name = name.rsplit('.', 1)[1] if '.' in name else name
-                
-                if module_path:
-                    module = model
-                    for part in module_path.split('.'):
-                        module = getattr(module, part)
-                else:
-                    module = model
-                
-                # Determine if buffer was persistent
-                # Non-persistent buffers aren't saved in state_dict
-                is_persistent = buffer_name in dict(module._buffers)
                 module.register_buffer(buffer_name, buffer.to(target_device), persistent=is_persistent)
             moved_buffers += 1
     
