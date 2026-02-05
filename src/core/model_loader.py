@@ -811,14 +811,15 @@ def materialize_model(runner: VideoDiffusionInfer, model_type: str, device: torc
     model = apply_model_specific_config(model, runner, config, is_dit, debug)
     
     # Verify runner reference is updated after apply_model_specific_config
+    # This handles edge cases where apply_model_specific_config might not update runner.dit correctly
     if is_dit:
         final_device = next(runner.dit.parameters()).device
         if final_device.type == 'meta':
-            debug.log(f"ERROR: runner.dit on meta device after config application!",
-                     level="ERROR", category=model_type, force=True)
-            # Force update runner.dit to the correctly loaded model
+            # Auto-recover by force updating runner.dit
+            debug.log(f"Warning: runner.dit still on meta device after config application, auto-correcting",
+                     level="WARNING", category=model_type, force=True)
             runner.dit = model
-            debug.log(f"Fixed: runner.dit updated to materialized model on {next(runner.dit.parameters()).device}",
+            debug.log(f"Corrected: runner.dit updated to materialized model on {next(runner.dit.parameters()).device}",
                      category=model_type, force=True)
     
     debug.end_timer(f"{model_type}_materialize", f"{model_type_upper} materialized")
