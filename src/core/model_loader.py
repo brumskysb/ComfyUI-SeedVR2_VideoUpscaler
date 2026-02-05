@@ -599,6 +599,11 @@ def _load_model_weights(model: torch.nn.Module, checkpoint_path: str, target_dev
     if used_meta:
         initialize_meta_buffers(model, target_device, debug)
     
+    # Ensure all parameters and buffers are on the target device
+    # This is critical for pre-quantized models (NVFP4, etc.) where some tensors
+    # may not have been properly moved during load_state_dict
+    model = _ensure_device_consistency(model, target_device, model_type, debug)
+    
     return model
 
 
@@ -813,6 +818,91 @@ def initialize_meta_buffers_impl(model: torch.nn.Module, target_device: torch.de
             initialized_count += 1
     
     return initialized_count
+
+
+def _ensure_device_consistency(model: torch.nn.Module, target_device: torch.device, 
+                               model_type: str, debug: Optional['Debug'] = None) -> torch.nn.Module:
+    """
+    Ensure all model parameters and buffers are on the target device.
+    
+    This is critical for pre-quantized models (NVFP4, etc.) where some tensors
+    may not have been properly moved to the target device during load_state_dict.
+    The issue can occur when:
+    1. Certain tensor formats aren't compatible with direct GPU loading
+    2. Extra metadata tensors don't get assigned to the model but affect other tensors
+    3. Buffers are registered after state_dict loading
+    
+    Args:
+        model: Model to check for device consistency
+        target_device: Target device all tensors should be on
+        model_type: Model type string for logging
+        debug: Debug instance for logging
+        
+    Returns:
+        Model with all tensors on the target device
+    """
+    model_type_lower = model_type.lower()
+    moved_params = 0
+    moved_buffers = 0
+    
+    # Check and move parameters
+    for name, param in model.named_parameters():
+        if param is not None and param.device != target_device:
+            if param.device.type == 'meta':
+                # Meta device parameters shouldn't exist at this point, but handle gracefully
+                if debug:
+                    debug.log(f"Parameter {name} still on meta device, initializing as zeros", 
+                             level="WARNING", category=model_type_lower, indent_level=1)
+                # Get parent module and set the parameter
+                parent, param_name = _navigate_to_parameter(model, name)
+                setattr(parent, param_name, torch.nn.Parameter(
+                    torch.zeros_like(param, device=target_device), 
+                    requires_grad=param.requires_grad
+                ))
+            else:
+                # Move parameter from wrong device (e.g., CPU) to target device
+                parent, param_name = _navigate_to_parameter(model, name)
+                setattr(parent, param_name, torch.nn.Parameter(
+                    param.data.to(target_device), 
+                    requires_grad=param.requires_grad
+                ))
+            moved_params += 1
+    
+    # Check and move buffers
+    for name, buffer in model.named_buffers():
+        if buffer is not None and buffer.device != target_device:
+            # Get module and buffer name
+            module_path = name.rsplit('.', 1)[0] if '.' in name else ''
+            buffer_name = name.rsplit('.', 1)[1] if '.' in name else name
+            
+            if module_path:
+                module = model
+                for part in module_path.split('.'):
+                    module = getattr(module, part)
+            else:
+                module = model
+            
+            # Determine persistence: if buffer appears in state_dict, it's persistent
+            # Use state_dict() check which is the official way to determine persistence
+            module_state_dict = module.state_dict()
+            is_persistent = buffer_name in module_state_dict
+            
+            if buffer.device.type == 'meta':
+                # Meta buffers should have been handled by initialize_meta_buffers
+                # but handle any missed ones
+                initialized_buffer = torch.zeros_like(buffer, device=target_device)
+                module.register_buffer(buffer_name, initialized_buffer, persistent=is_persistent)
+            else:
+                # Move buffer from wrong device to target device
+                module.register_buffer(buffer_name, buffer.to(target_device), persistent=is_persistent)
+            moved_buffers += 1
+    
+    if moved_params > 0 or moved_buffers > 0:
+        if debug:
+            debug.log(f"Device consistency check: moved {moved_params} params, {moved_buffers} buffers to {target_device}", 
+                     category=model_type_lower, indent_level=1)
+    
+    return model
 
 
 def _load_standard_weights(model: torch.nn.Module, state: Dict[str, torch.Tensor], 

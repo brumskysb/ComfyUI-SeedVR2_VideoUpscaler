@@ -37,6 +37,8 @@ MODEL_REGISTRY = {
     "seedvr2_ema_3b-Q8_0.gguf": ModelInfo(repo="AInVFX/SeedVR2_comfyUI", size="3B", precision="Q8_0", sha256="be0d60083a2051a265eb4b77f28edf494e6db67ffc250216f32b72292e5cbd96"),
     "seedvr2_ema_3b_fp8_e4m3fn.safetensors": ModelInfo(size="3B", precision="fp8_e4m3fn", sha256="3bf1e43ebedd570e7e7a0b1b60d6a02e105978f505c8128a241cde99a8240cff"),
     "seedvr2_ema_3b_fp16.safetensors": ModelInfo(size="3B", precision="fp16", sha256="2fd0e03a3dad24e07086750360727ca437de4ecd456f769856e960ae93e2b304"),
+    "seedvr2_ema_3b_nvfp4_native.safetensors": ModelInfo(size="3B", precision="nvfp4", sha256="6c7bfbc668917480eb0ce395d4d27d92e6c9f6ade39c1d7c0f31b72bbd321440"),
+    "seedvr2_nvfp4_blackwell.safetensors": ModelInfo(size="3B", precision="nvfp4_blackwell", sha256="f2c65bc0a676d31e537771b308a8b0cd7fef788fc7de76b6c6349122d6cea599"),
     
     # 7B models
     "seedvr2_ema_7b-Q4_K_M.gguf": ModelInfo(repo="AInVFX/SeedVR2_comfyUI", size="7B", precision="Q4_K_M", sha256="db9cb2ad90ebd40d2e8c29da2b3fc6fd03ba87cd58cbadceccca13ad27162789"),

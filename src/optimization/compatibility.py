@@ -564,6 +564,47 @@ except ImportError:
     GGMLQuantizationType = None
 
 
+# 4. comfy-kitchen - Required for NVFP4 quantization (Blackwell GPUs recommended for HW acceleration)
+try:
+    import comfy_kitchen as ck
+    from comfy_kitchen.tensor import QuantizedTensor, TensorCoreNVFP4Layout
+    COMFY_KITCHEN_AVAILABLE = True
+except ImportError:
+    COMFY_KITCHEN_AVAILABLE = False
+    ck = None
+    QuantizedTensor = None
+    TensorCoreNVFP4Layout = None
+
+
+def validate_nvfp4_availability(operation: str = "use NVFP4 quantization", debug=None) -> None:
+    """
+    Validate comfy-kitchen availability for NVFP4 operations.
+    
+    Args:
+        operation: Description of the operation requiring NVFP4
+        debug: Optional debug instance for logging
+        
+    Raises:
+        RuntimeError: If comfy-kitchen is not available
+    """
+    if not COMFY_KITCHEN_AVAILABLE:
+        error_msg = (
+            f"Cannot {operation}: comfy-kitchen library is not installed.\n"
+            f"\n"
+            f"NVFP4 provides 4-bit quantization for memory-efficient DiT inference.\n"
+            f"Requires Blackwell GPU (RTX 50xx) for hardware acceleration.\n"
+            f"\n"
+            f"To fix this issue:\n"
+            f"  1. Install comfy-kitchen: pip install comfy-kitchen[cublas]\n"
+            f"  2. OR disable NVFP4 quantization in settings\n"
+            f"\n"
+            f"For more info: https://github.com/Comfy-Org/comfy-kitchen"
+        )
+        if debug:
+            debug.log(error_msg, level="ERROR", category="setup", force=True)
+        raise RuntimeError(f"comfy-kitchen library required to {operation}")
+
+
 def validate_gguf_availability(operation: str = "load GGUF model", debug=None) -> None:
     """
     Validate GGUF availability and raise error if not installed.
@@ -648,6 +689,7 @@ if not os.environ.get("SEEDVR2_OPTIMIZATIONS_LOGGED"):
     sage_status = "✅" if SAGE_ATTN_AVAILABLE else "❌"
     flash_status = "✅" if FLASH_ATTN_AVAILABLE else "❌"
     triton_status = "✅" if TRITON_AVAILABLE else "❌"
+    nvfp4_status = "✅" if COMFY_KITCHEN_AVAILABLE else "❌"
     
     # Count available optimizations
     available = [SAGE_ATTN_AVAILABLE, FLASH_ATTN_AVAILABLE, TRITON_AVAILABLE]
@@ -672,6 +714,10 @@ if not os.environ.get("SEEDVR2_OPTIMIZATIONS_LOGGED"):
             missing.append("triton")
         if missing:
             print(f"💡 Optional: pip install {' '.join(missing)}")
+    
+    # NVFP4/comfy-kitchen status (separate line for Blackwell-specific feature)
+    if COMFY_KITCHEN_AVAILABLE:
+        print(f"🔬 NVFP4 quantization: {nvfp4_status} (comfy-kitchen available for Blackwell GPUs)")
     
     # Conv3d workaround status (if applicable)
     if NVIDIA_CONV3D_MEMORY_BUG_WORKAROUND:
