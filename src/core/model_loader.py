@@ -794,11 +794,32 @@ def materialize_model(runner: VideoDiffusionInfer, model_type: str, device: torc
     # Load weights (this materializes from meta to target device)
     model = _load_model_weights(model, checkpoint_path, target_device, True,
                                model_type_upper, offload_reason, debug, override_dtype) 
+    
+    # Verify model is on expected device after loading
+    actual_device = next(model.parameters()).device
+    if actual_device.type == 'meta':
+        debug.log(f"ERROR: {model_type_upper} still on meta device after weight loading!", 
+                 level="ERROR", category=model_type, force=True)
+        raise RuntimeError(f"{model_type_upper} failed to materialize from meta device")
+    elif actual_device != target_device:
+        debug.log(f"Note: {model_type_upper} on {actual_device} (expected {target_device})",
+                 category=model_type)
    
     # Apply model-specific configurations (includes BlockSwap and torch.compile)
     # Import here to avoid circular dependency 
     from .model_configuration import apply_model_specific_config
     model = apply_model_specific_config(model, runner, config, is_dit, debug)
+    
+    # Verify runner reference is updated after apply_model_specific_config
+    if is_dit:
+        final_device = next(runner.dit.parameters()).device
+        if final_device.type == 'meta':
+            debug.log(f"ERROR: runner.dit on meta device after config application!",
+                     level="ERROR", category=model_type, force=True)
+            # Force update runner.dit to the correctly loaded model
+            runner.dit = model
+            debug.log(f"Fixed: runner.dit updated to materialized model on {next(runner.dit.parameters()).device}",
+                     category=model_type, force=True)
     
     debug.end_timer(f"{model_type}_materialize", f"{model_type_upper} materialized")
     
