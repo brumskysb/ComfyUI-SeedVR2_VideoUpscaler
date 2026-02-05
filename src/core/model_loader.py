@@ -82,6 +82,19 @@ from ..utils.constants import get_script_directory, suppress_tensor_warnings
 # Get script directory for config paths
 script_directory = get_script_directory()
 
+# Model architecture detection constants
+# 3B model: num_layers=32, vid_dim=2560
+# 7B model: num_layers=36, vid_dim=3072
+ARCH_3B_LAYERS = 32
+ARCH_7B_LAYERS = 36
+ARCH_3B_VID_DIM = 2560
+ARCH_7B_VID_DIM = 3072
+# Thresholds for classification when values don't match exactly
+# Layer threshold: midpoint between 32 and 36 = 34
+ARCH_LAYER_THRESHOLD = (ARCH_3B_LAYERS + ARCH_7B_LAYERS) // 2  # 34
+# Dimension threshold: midpoint between 2560 and 3072 = 2816
+ARCH_DIM_THRESHOLD = (ARCH_3B_VID_DIM + ARCH_7B_VID_DIM) // 2  # 2816
+
 
 def load_quantized_state_dict(checkpoint_path: str, device: torch.device = torch.device("cpu"),
                               debug: Optional['Debug'] = None) -> Dict[str, torch.Tensor]:
@@ -227,15 +240,29 @@ def _detect_safetensors_architecture(checkpoint_path: str, debug: Optional['Debu
         num_layers = max_block_idx + 1 if max_block_idx >= 0 else 0
         
         # Detect hidden dimension from vid_out_norm.weight or similar
+        # These tensors have the hidden dimension as their first (and often only) dimension:
+        # - vid_out_norm.weight: shape [vid_dim] - layer norm weight
+        # - blocks.0.ada.all.attn_shift: shape [vid_dim] - adaptive layer shift
+        # - emb_in.linear2.weight: shape [emb_dim, hidden] where we want the output dim
         vid_dim = None
-        dim_keys = ["vid_out_norm.weight", "emb_in.linear2.weight", "blocks.0.ada.all.attn_shift"]
+        # Priority order: single-dim tensors first (clearest signal)
+        dim_keys = ["vid_out_norm.weight", "blocks.0.ada.all.attn_shift"]
         for dim_key in dim_keys:
             if dim_key in keys:
-                tensor_shape = f.get_tensor(dim_key).shape
-                if len(tensor_shape) >= 1:
-                    # For most of these, the first dimension is the hidden dim
-                    vid_dim = tensor_shape[0] if len(tensor_shape) == 1 else tensor_shape[-1]
-                    break
+                # Use get_slice to get shape metadata without loading full tensor into memory
+                # For 1D tensors like norm weights and shift params, shape[0] is the hidden dim
+                try:
+                    tensor_slice = f.get_slice(dim_key)
+                    tensor_shape = tensor_slice.get_shape()
+                    if len(tensor_shape) >= 1:
+                        vid_dim = tensor_shape[0]
+                        break
+                except (AttributeError, KeyError):
+                    # Fallback: load tensor if get_slice not available (older safetensors)
+                    tensor_shape = f.get_tensor(dim_key).shape
+                    if len(tensor_shape) >= 1:
+                        vid_dim = tensor_shape[0]
+                        break
         
         return _classify_architecture(num_layers, vid_dim, debug)
 
@@ -270,12 +297,16 @@ def _detect_gguf_architecture(checkpoint_path: str, debug: Optional['Debug'] = N
                 except ValueError:
                     continue
         
-        # Try to detect vid_dim from specific tensors
+        # Try to detect vid_dim from specific 1D tensors
+        # These are the same tensors we check in SafeTensors detection
         if name in ["vid_out_norm.weight", "blocks.0.ada.all.attn_shift"]:
             shape = tensor.shape
             if len(shape) >= 1:
-                # GGUF shapes are reversed
-                vid_dim = shape[-1] if len(shape) == 1 else shape[0]
+                # GGUF stores shapes in C order (row-major), same as PyTorch
+                # For 1D tensors, shape[0] is the dimension we want
+                # Note: Earlier versions had shapes reversed, but current gguf library
+                # returns shapes in standard order
+                vid_dim = shape[0]
     
     num_layers = max_block_idx + 1 if max_block_idx >= 0 else 0
     return _classify_architecture(num_layers, vid_dim, debug)
@@ -284,10 +315,11 @@ def _detect_gguf_architecture(checkpoint_path: str, debug: Optional['Debug'] = N
 def _detect_pth_architecture(checkpoint_path: str, debug: Optional['Debug'] = None) -> str:
     """
     Detect architecture from PyTorch checkpoint file.
-    Uses memory-mapped loading to avoid loading full weights.
+    Uses memory-mapped loading to avoid loading full weights into memory.
     """
-    # Load only keys without full tensor data
-    state = torch.load(checkpoint_path, map_location="meta", mmap=True, weights_only=True)
+    # Load with mmap=True to memory-map the file, reducing memory usage
+    # map_location="cpu" is required because mmap is not compatible with "meta"
+    state = torch.load(checkpoint_path, map_location="cpu", mmap=True, weights_only=True)
     
     max_block_idx = -1
     vid_dim = None
@@ -320,6 +352,13 @@ def _classify_architecture(num_layers: int, vid_dim: Optional[int], debug: Optio
     - 3B model: num_layers=32, vid_dim=2560
     - 7B model: num_layers=36, vid_dim=3072
     
+    Classification priority:
+    1. Exact num_layers match (32 or 36) is authoritative
+    2. Exact vid_dim match (2560 or 3072) is authoritative  
+    3. Threshold-based detection is used when exact matches aren't found
+    4. If num_layers and vid_dim conflict, vid_dim takes precedence (more reliable)
+    5. Defaults to "3b" for backward compatibility
+    
     Args:
         num_layers: Detected number of transformer blocks
         vid_dim: Detected hidden dimension (can be None)
@@ -331,30 +370,50 @@ def _classify_architecture(num_layers: int, vid_dim: Optional[int], debug: Optio
     if debug:
         debug.log(f"Detected architecture: num_layers={num_layers}, vid_dim={vid_dim}", category="dit", indent_level=1)
     
-    # Classification based on both num_layers and vid_dim for maximum accuracy
-    # 7B model signature: 36 layers, 3072 dim
-    # 3B model signature: 32 layers, 2560 dim
+    # Track what each indicator suggests for conflict detection
+    layers_suggests = None  # None = unknown, True = 7B, False = 3B
+    dim_suggests = None
     
-    is_7b = False
+    # Check num_layers
+    if num_layers == ARCH_7B_LAYERS:  # 36
+        layers_suggests = True  # 7B
+    elif num_layers == ARCH_3B_LAYERS:  # 32
+        layers_suggests = False  # 3B
+    elif num_layers > ARCH_LAYER_THRESHOLD:  # > 34
+        layers_suggests = True  # likely 7B
+    elif num_layers > 0:
+        layers_suggests = False  # likely 3B
     
-    # Primary check: num_layers
-    if num_layers == 36:
-        is_7b = True
-    elif num_layers == 32:
-        is_7b = False
-    elif num_layers > 34:
-        # More than 34 layers suggests 7B
-        is_7b = True
-    
-    # Secondary check: vid_dim (only if num_layers is ambiguous)
+    # Check vid_dim
     if vid_dim is not None:
-        if vid_dim == 3072:
-            is_7b = True
-        elif vid_dim == 2560:
-            is_7b = False
-        elif vid_dim > 2800:
-            # Dimension greater than midpoint suggests 7B
-            is_7b = True
+        if vid_dim == ARCH_7B_VID_DIM:  # 3072
+            dim_suggests = True  # 7B
+        elif vid_dim == ARCH_3B_VID_DIM:  # 2560
+            dim_suggests = False  # 3B
+        elif vid_dim > ARCH_DIM_THRESHOLD:  # > 2816
+            dim_suggests = True  # likely 7B
+        else:
+            dim_suggests = False  # likely 3B
+    
+    # Detect and log conflicts
+    if layers_suggests is not None and dim_suggests is not None and layers_suggests != dim_suggests:
+        layers_str = "7B" if layers_suggests else "3B"
+        dim_str = "7B" if dim_suggests else "3B"
+        if debug:
+            debug.log(
+                f"Warning: Architecture indicators conflict - layers suggest {layers_str}, "
+                f"dimensions suggest {dim_str}. Using dimension-based result (more reliable).",
+                level="WARNING", category="dit", indent_level=1, force=True
+            )
+    
+    # Determine final result
+    # Priority: exact dim > exact layers > threshold dim > threshold layers > default
+    if dim_suggests is not None:
+        is_7b = dim_suggests  # vid_dim takes precedence (more reliable indicator)
+    elif layers_suggests is not None:
+        is_7b = layers_suggests
+    else:
+        is_7b = False  # default to 3B
     
     result = "7b" if is_7b else "3b"
     if debug:

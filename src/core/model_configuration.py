@@ -725,14 +725,20 @@ def _create_new_runner(
     # Determine model architecture - prefer checkpoint-based detection
     model_arch = None
     
-    # Try to detect architecture from checkpoint file
+    # Try to find and inspect checkpoint file for architecture detection
+    dit_checkpoint_path = None
     try:
         dit_checkpoint_path = find_model_file(dit_model, base_cache_dir)
-        if dit_checkpoint_path and os.path.exists(dit_checkpoint_path):
+    except Exception as e:
+        debug.log(f"Could not find model file '{dit_model}': {e}", level="WARNING", category="dit")
+    
+    # Try to detect architecture from checkpoint if file was found
+    if dit_checkpoint_path and os.path.exists(dit_checkpoint_path):
+        try:
             model_arch = detect_model_architecture(dit_checkpoint_path, debug)
             debug.log(f"Detected model architecture from checkpoint: {model_arch.upper()}", category="dit")
-    except Exception as e:
-        debug.log(f"Checkpoint-based architecture detection failed: {e}", level="WARNING", category="dit")
+        except Exception as e:
+            debug.log(f"Architecture detection from checkpoint failed: {e}", level="WARNING", category="dit")
     
     # Fall back to filename-based detection
     if model_arch is None:
